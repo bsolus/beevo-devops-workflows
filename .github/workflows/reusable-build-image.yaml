@@ -1,0 +1,139 @@
+# =============================================================================
+# Reusable Build & Push Docker Image
+# =============================================================================
+# Usage: any project repo calls this via workflow_call with inputs.
+# Originally derived from beevo-project-fpf-skeleton/.github/workflows/build-image.yml
+#
+# Inputs:
+#   image_name      — Docker image name (e.g. beevo-project-fpf)
+#   dockerfile      — path to Dockerfile (default: Dockerfile)
+#   build_context   — build context (default: .)
+#   build_args      — newline-separated build-args (optional)
+#   platforms       — target platforms (default: linux/amd64)
+#
+# Secrets:
+#   gh_token        — GitHub token with packages:write scope
+#   beevo_manager_token — optional, passed as build secret
+#
+# Tags produced:
+#   <branch>-<short_sha>
+#   <branch>-latest
+#   latest (only on production branch)
+# =============================================================================
+
+name: "Reusable — Build & Push Docker Image"
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Docker image name (without registry prefix)"
+        required: true
+        type: string
+      dockerfile:
+        description: "Path to Dockerfile"
+        required: false
+        type: string
+        default: "Dockerfile"
+      build_context:
+        description: "Build context path"
+        required: false
+        type: string
+        default: "."
+      build_args:
+        description: "Additional build arguments (newline-separated KEY=VALUE)"
+        required: false
+        type: string
+        default: ""
+      platforms:
+        description: "Target platforms (comma-separated)"
+        required: false
+        type: string
+        default: "linux/amd64"
+    secrets:
+      gh_token:
+        description: "GitHub token with packages:write scope"
+        required: true
+      beevo_manager_token:
+        description: "Beevo Manager token passed as build secret"
+        required: false
+    outputs:
+      image_tag:
+        description: "Immutable tag <branch>-<short_sha>"
+        value: ${{ jobs.build.outputs.image_tag }}
+      short_sha:
+        description: "7-character SHA"
+        value: ${{ jobs.build.outputs.short_sha }}
+
+jobs:
+  build:
+    runs-on: self-hosted
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.tags.outputs.image_tag }}
+      short_sha: ${{ steps.tags.outputs.short_sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.gh_token }}
+
+      - name: Compute image tag
+        id: tags
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE_TAG="${{ github.ref_name }}-${SHORT_SHA}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}"
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}
+          tags: |
+            type=raw,value=${{ steps.tags.outputs.image_tag }}
+            type=raw,value=${{ github.ref_name }}-latest
+            type=raw,value=latest,enable=${{ github.ref_name == 'production' }}
+
+      - name: Parse build args
+        id: build_args
+        run: |
+          ARGS="GIT_SHA=${{ github.sha }}"
+          if [ -n "${{ inputs.build_args }}" ]; then
+            while IFS= read -r line; do
+              [ -n "$line" ] && ARGS="${ARGS}${line}"
+            done <<< "${{ inputs.build_args }}"
+          fi
+          echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: ${{ inputs.platforms }}
+          build-args: ${{ steps.build_args.outputs.args }}
+          secrets: |
+            beevo_token=${{ secrets.beevo_manager_token }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
+
+      - name: Logout from GitHub Container Registry
+        if: always()
+        run: docker logout ghcr.io

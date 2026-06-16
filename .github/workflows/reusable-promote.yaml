@@ -1,0 +1,184 @@
+# =============================================================================
+# Reusable Promote Image to K8s
+# =============================================================================
+# Usage: project repos call this via workflow_call after a successful build.
+# Originally derived from beevo-project-fpf-skeleton/.github/workflows/promote-to-k8s.yml
+#
+# Inputs:
+#   target_env        — target environment (e.g. staging, production)
+#   client_id         — client identifier used in iac-clients path (e.g. beevo-project-fpf)
+#   image_tag         — immutable tag to promote
+#   branch_base       — base branch for PR (default: main)
+#
+# Secrets:
+#   gh_app_client_id      — GitHub App client ID (beevo-bot)
+#   gh_app_private_key    — GitHub App private key
+#
+# Outputs:
+#   pr_url        — URL of the created PR
+#   pr_branch     — branch name used for the PR
+# =============================================================================
+
+name: "Reusable — Promote Image to K8s"
+
+on:
+  workflow_call:
+    inputs:
+      target_env:
+        description: "Target environment (staging, production, etc.)"
+        required: true
+        type: string
+      client_id:
+        description: "Client ID used in iac-clients path (e.g. beevo-project-fpf)"
+        required: true
+        type: string
+      image_tag:
+        description: "Image tag to promote (e.g. staging-abc1234)"
+        required: true
+        type: string
+      branch_base:
+        description: "Base branch for the PR (default: main)"
+        required: false
+        type: string
+        default: "main"
+      iac_clients_repo:
+        description: "Name of the iac-clients repo (default: beevo-devops-iac-clients)"
+        required: false
+        type: string
+        default: "beevo-devops-iac-clients"
+    secrets:
+      gh_app_client_id:
+        description: "GitHub App Client ID"
+        required: true
+      gh_app_private_key:
+        description: "GitHub App Private Key"
+        required: true
+    outputs:
+      pr_url:
+        description: "URL of the created PR"
+        value: ${{ jobs.promote.outputs.pr_url }}
+      pr_branch:
+        description: "Branch name used for the PR"
+        value: ${{ jobs.promote.outputs.pr_branch }}
+
+jobs:
+  promote:
+    runs-on: self-hosted
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      pr_url: ${{ steps.pr.outputs.pull-request-url }}
+      pr_branch: ${{ steps.pr_branch.outputs.branch }}
+
+    steps:
+      - name: Generate GitHub App token for iac-clients
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.gh_app_client_id }}
+          private-key: ${{ secrets.gh_app_private_key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ inputs.iac_clients_repo }}
+
+      - name: Checkout iac-clients repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ inputs.iac_clients_repo }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: iac-clients
+
+      - name: Setup yq
+        uses: chrisdickinson/setup-yq@v1.0.1
+        with:
+          yq-version: v4.45.4
+
+      - name: Check environment exists
+        id: env-check
+        working-directory: iac-clients
+        run: |
+          ENV_FILE="clients/${{ inputs.client_id }}/environments/${{ inputs.target_env }}/values.yaml"
+          if [ ! -f "$ENV_FILE" ]; then
+            echo "::warning::Environment file $ENV_FILE does not exist — skipping promotion."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Update image tag in iac-clients
+        id: update
+        if: ${{ steps.env-check.outputs.skip != 'true' }}
+        working-directory: iac-clients
+        run: |
+          ENV_FILE="clients/${{ inputs.client_id }}/environments/${{ inputs.target_env }}/values.yaml"
+          yq eval '.web.image.tag = "${{ inputs.image_tag }}"' -i "$ENV_FILE"
+
+          if git diff --quiet "$ENV_FILE"; then
+            echo "::notice::Tag already at ${{ inputs.image_tag }} — nothing to promote."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Determine PR branch name
+        id: pr_branch
+        if: ${{ steps.update.outputs.skip != 'true' }}
+        run: |
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          BRANCH="image/${REPO_NAME}/${{ inputs.target_env }}"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine labels
+        id: labels
+        if: ${{ steps.update.outputs.skip != 'true' }}
+        run: |
+          if [ "${{ inputs.target_env }}" = "staging" ]; then
+            echo "labels=auto-promote,env-staging" >> "$GITHUB_OUTPUT"
+          else
+            echo "labels=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Pull Request in iac-clients
+        id: pr
+        if: ${{ steps.update.outputs.skip != 'true' }}
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          path: iac-clients
+          base: ${{ inputs.branch_base }}
+          branch: ${{ steps.pr_branch.outputs.branch }}
+          title: "[bot] Promote ${{ github.event.repository.name }} image ${{ inputs.image_tag }}"
+          body: |
+            Image built from branch **${{ inputs.target_env }}**:
+            - **Tag:** **${{ inputs.image_tag }}**
+            - **Registry:** ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ inputs.image_tag }}
+
+            Auto-generated by reusable promote workflow.
+          commit-message: "feat: promote image to ${{ inputs.image_tag }}"
+          author: "Beevo Bot <bot@beevo.pt>"
+          delete-branch: false
+          draft: false
+          labels: ${{ steps.labels.outputs.labels }}
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ steps.env-check.outputs.skip }}" = "true" ]; then
+            echo "## ℹ️ Promotion skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "No environment file for **${{ inputs.target_env }}** — create it first if you want promotion." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "${{ steps.update.outputs.skip }}" = "true" ]; then
+            echo "## ℹ️ Promotion skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "Tag is already up-to-date." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "## ✅ Promotion started" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Image tag:** ${{ inputs.image_tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Branch:** ${{ steps.pr_branch.outputs.branch }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${{ steps.pr.outputs.pull-request-url }}" ]; then
+            echo "- **PR:** ${{ steps.pr.outputs.pull-request-url }}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "> ⚠️ PR requires manual review and merge for GitOps to pick up the change." >> "$GITHUB_STEP_SUMMARY"
